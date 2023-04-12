@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model.warplayer import warp
 from model.refine import *
+from VFIformer import *
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+import logging
 
 def deconv(in_planes, out_planes, kernel_size=4, stride=2, padding=1):
     return nn.Sequential(
@@ -94,6 +97,7 @@ class IFNet(nn.Module):
             merged_teacher = warped_img0_teacher * mask_teacher + warped_img1_teacher * (1 - mask_teacher)
         else:
             flow_teacher = None
+
             merged_teacher = None
         for i in range(3):
             merged[i] = merged[i][0] * mask_list[i] + merged[i][1] * (1 - mask_list[i])
@@ -105,4 +109,5 @@ class IFNet(nn.Module):
         tmp = self.unet(img0, img1, warped_img0, warped_img1, mask, flow, c0, c1)
         res = tmp[:, :3] * 2 - 1
         merged[2] = torch.clamp(merged[2] + res, 0, 1)
-        return flow_list, mask_list[2], merged, flow_teacher, merged_teacher, loss_distill
+        return flow, flow_list, flow_teacher, merged, c0, c1, warped_img0, warped_img1, merged_teacher, loss_distill
+        # return flow_list, mask_list[2], merged, flow_teacher, merged_teacher, loss_distill

@@ -120,6 +120,198 @@ class VGGPerceptualLoss(torch.nn.Module):
                 k += 1
         return loss
 
+class PerceptualLoss(nn.Module):
+    """Perceptual loss with commonly used style loss.
+    Args:
+        layer_weights (dict): The weight for each layer of vgg feature.
+            Here is an example: {'conv5_4': 1.}, which means the conv5_4
+            feature layer (before relu5_4) will be extracted with weight
+            1.0 in calculting losses.
+        vgg_type (str): The type of vgg network used as feature extractor.
+            Default: 'vgg19'.
+        use_input_norm (bool):  If True, normalize the input image in vgg.
+            Default: True.
+        perceptual_weight (float): If `perceptual_weight > 0`, the perceptual
+            loss will be calculated and the loss will multiplied by the
+            weight. Default: 1.0.
+        style_weight (float): If `style_weight > 0`, the style loss will be
+            calculated and the loss will multiplied by the weight.
+            Default: 0.
+        norm_img (bool): If True, the image will be normed to [0, 1]. Note that
+            this is different from the `use_input_norm` which norm the input in
+            in forward function of vgg according to the statistics of dataset.
+            Importantly, the input image must be in range [-1, 1].
+            Default: False.
+        criterion (str): Criterion used for perceptual loss. Default: 'l1'.
+    """
+
+    def __init__(self,
+                 layer_weights,
+                 vgg_type='vgg19',
+                 use_input_norm=True,
+                 perceptual_weight=1.0,
+                 style_weight=0.,
+                 norm_img=False,
+                 criterion='l1'):
+        super(PerceptualLoss, self).__init__()
+        self.norm_img = norm_img
+        self.perceptual_weight = perceptual_weight
+        self.style_weight = style_weight
+        self.layer_weights = layer_weights
+        self.vgg = VGGFeatureExtractor(
+            layer_name_list=list(layer_weights.keys()),
+            vgg_type=vgg_type,
+            use_input_norm=use_input_norm)
+
+        self.criterion_type = criterion
+        if self.criterion_type == 'l1':
+            self.criterion = torch.nn.L1Loss()
+        elif self.criterion_type == 'l2':
+            self.criterion = torch.nn.L2loss()
+        elif self.criterion_type == 'fro':
+            self.criterion = None
+        else:
+            raise NotImplementedError(
+                f'{criterion} criterion has not been supported.')
+
+    def forward(self, x, gt):
+        """Forward function.
+        Args:
+            x (Tensor): Input tensor with shape (n, c, h, w).
+            gt (Tensor): Ground-truth tensor with shape (n, c, h, w).
+        Returns:
+            Tensor: Forward results.
+        """
+
+        if self.norm_img:
+            x = (x + 1.) * 0.5
+            gt = (gt + 1.) * 0.5
+
+        # extract vgg features
+        x_features = self.vgg(x)
+        gt_features = self.vgg(gt.detach())
+
+        # calculate perceptual loss
+        if self.perceptual_weight > 0:
+            percep_loss = 0
+            for k in x_features.keys():
+                if self.criterion_type == 'fro':
+                    percep_loss += torch.norm(
+                        x_features[k] - gt_features[k],
+                        p='fro') * self.layer_weights[k]
+                else:
+                    percep_loss += self.criterion(
+                        x_features[k], gt_features[k]) * self.layer_weights[k]
+            percep_loss *= self.perceptual_weight
+        else:
+            percep_loss = None
+
+        # calculate style loss
+        if self.style_weight > 0:
+            style_loss = 0
+            for k in x_features.keys():
+                if self.criterion_type == 'fro':
+                    style_loss += torch.norm(
+                        self._gram_mat(x_features[k]) -
+                        self._gram_mat(gt_features[k]),
+                        p='fro') * self.layer_weights[k]
+                else:
+                    style_loss += self.criterion(
+                        self._gram_mat(x_features[k]),
+                        self._gram_mat(gt_features[k])) * self.layer_weights[k]
+            style_loss *= self.style_weight
+        else:
+            style_loss = None
+
+        return percep_loss, style_loss
+
+    def _gram_mat(self, x):
+        """Calculate Gram matrix.
+        Args:
+            x (torch.Tensor): Tensor with shape of (n, c, h, w).
+        Returns:
+            torch.Tensor: Gram matrix.
+        """
+        n, c, h, w = x.size()
+        features = x.view(n, c, w * h)
+        features_t = features.transpose(1, 2)
+        gram = features.bmm(features_t) / (c * h * w)
+        return gram
+
+
+## relative gan
+class AdversarialLoss(nn.Module):
+    def __init__(self, use_cpu=False, gpu_ids=[], dist=False, gan_type='RGAN', gan_k=2,
+                 lr_dis=1e-4, train_crop_size=40):
+
+        super(AdversarialLoss, self).__init__()
+        self.gan_type = gan_type
+        self.gan_k = gan_k
+        self.device = torch.device('cpu' if use_cpu else 'cuda')
+        self.discriminator = VGGStyleDiscriminator160(num_in_ch=3, num_feat=64).to(self.device)
+        if dist:
+            self.discriminator = DistributedDataParallel(self.discriminator, device_ids=[torch.cuda.current_device()])
+        else:
+            self.discriminator = nn.DataParallel(self.discriminator, gpu_ids)
+
+        self.optimizer = torch.optim.Adam(
+            self.discriminator.parameters(),
+            betas=(0, 0.9), eps=1e-8, lr=lr_dis
+        )
+
+        self.criterion_adv = GANLoss(gan_type='vanilla').to(self.device)
+
+    def set_requires_grad(self, nets, requires_grad=False):
+        """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
+        Parameters:
+            nets (network list)   -- a list of networks
+            requires_grad (bool)  -- whether the networks require gradients or not
+        """
+        if not isinstance(nets, list):
+            nets = [nets]
+        for net in nets:
+            if net is not None:
+                for param in net.parameters():
+                    param.requires_grad = requires_grad
+
+    def forward(self, fake, real):
+
+        # D Loss
+        for _ in range(self.gan_k):
+            self.set_requires_grad(self.discriminator, True)
+            self.optimizer.zero_grad()
+            # real
+            d_fake = self.discriminator(fake).detach()
+            d_real = self.discriminator(real)
+            d_real_loss = self.criterion_adv(d_real - torch.mean(d_fake), True,
+                                             is_disc=True) * 0.5
+            d_real_loss.backward()
+            # fake
+            d_fake = self.discriminator(fake.detach())
+            d_fake_loss = self.criterion_adv(d_fake - torch.mean(d_real.detach()), False,
+                                             is_disc=True) * 0.5
+            d_fake_loss.backward()
+            loss_d = d_real_loss + d_fake_loss
+
+            self.optimizer.step()
+
+        # G Loss
+        self.set_requires_grad(self.discriminator, False)
+        d_real = self.discriminator(real).detach()
+        d_fake = self.discriminator(fake)
+        g_real_loss = self.criterion_adv(d_real - torch.mean(d_fake), False, is_disc=False) * 0.5
+        g_fake_loss = self.criterion_adv(d_fake - torch.mean(d_real), True, is_disc=False) * 0.5
+        loss_g = g_real_loss + g_fake_loss
+
+        # Generator loss
+        return loss_g, loss_d
+
+    def state_dict(self):
+        D_state_dict = self.discriminator.state_dict()
+        D_optim_state_dict = self.optimizer.state_dict()
+        return D_state_dict, D_optim_state_dict
+
+
 if __name__ == '__main__':
     img0 = torch.zeros(3, 3, 256, 256).float().to(device)
     img1 = torch.tensor(np.random.normal(

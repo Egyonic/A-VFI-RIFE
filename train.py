@@ -47,7 +47,7 @@ def train(model, local_rank):
     nr_eval = 0
     dataset = VimeoDataset('train')
     sampler = DistributedSampler(dataset)
-    train_data = DataLoader(dataset, batch_size=args.batch_size, num_workers=8, pin_memory=True, drop_last=True, sampler=sampler)
+    train_data = DataLoader(dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True, drop_last=True, sampler=sampler)
     args.step_per_epoch = train_data.__len__()
     dataset_val = VimeoDataset('validation')
     val_data = DataLoader(dataset_val, batch_size=16, pin_memory=True, num_workers=8)
@@ -61,7 +61,7 @@ def train(model, local_rank):
             data_gpu, timestep = data
             data_gpu = data_gpu.to(device, non_blocking=True) / 255.
             timestep = timestep.to(device, non_blocking=True)
-            imgs = data_gpu[:, :6]
+            imgs = data_gpu[:, :6]  # three channels per frame, f1, f2, tg, length is 9
             gt = data_gpu[:, 6:9]
             learning_rate = get_learning_rate(step) * args.world_size / 4
             pred, info = model.update(imgs, gt, learning_rate, training=True) # pass timestep if you are training RIFEm
@@ -70,7 +70,7 @@ def train(model, local_rank):
             if step % 200 == 1 and local_rank == 0:
                 writer.add_scalar('learning_rate', learning_rate, step)
                 writer.add_scalar('loss/l1', info['loss_l1'], step)
-                writer.add_scalar('loss/tea', info['loss_tea'], step)
+                # writer.add_scalar('loss/tea', info['loss_tea'], step)
                 writer.add_scalar('loss/distill', info['loss_distill'], step)
             if step % 1000 == 1 and local_rank == 0:
                 gt = (gt.permute(0, 2, 3, 1).detach().cpu().numpy() * 255).astype('uint8')
@@ -141,6 +141,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', default=16, type=int, help='minibatch size')
     parser.add_argument('--local_rank', default=0, type=int, help='local rank')
     parser.add_argument('--world_size', default=4, type=int, help='world size')
+    parser.add_argument('--phase', default='train', help='train phase')
     args = parser.parse_args()
     torch.distributed.init_process_group(backend="nccl", world_size=args.world_size)
     torch.cuda.set_device(args.local_rank)
@@ -150,6 +151,6 @@ if __name__ == "__main__":
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
-    model = Model(args.local_rank)
+    model = Model(args=args, local_rank=args.local_rank)
     train(model, args.local_rank)
         

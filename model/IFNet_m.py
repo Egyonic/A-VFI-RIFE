@@ -73,6 +73,7 @@ class IFNet_m(nn.Module):
         flow = None 
         loss_distill = 0
         stu = [self.block0, self.block1, self.block2]
+        h, w = x.shape[2], x.shape[3]
         for i in range(3):
             if flow != None:
                 flow_d, mask_d = stu[i](torch.cat((img0, img1, timestep, warped_img0, warped_img1, mask), 1), flow, scale=scale[i])
@@ -80,6 +81,8 @@ class IFNet_m(nn.Module):
                 mask = mask + mask_d
             else:
                 flow, mask = stu[i](torch.cat((img0, img1, timestep), 1), None, scale=scale[i])
+                flow = flow[:, :, : h, :w]
+                mask = mask[:, :, : h, :w]
             mask_list.append(torch.sigmoid(mask))
             flow_list.append(flow)
             warped_img0 = warp(img0, flow[:, :2])
